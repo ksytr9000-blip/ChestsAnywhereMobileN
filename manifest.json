@@ -1,7 +1,7 @@
 {
   "Name": "Chests Anywhere Mobile Nav",
   "Author": "OpenAI + user",
-  "Version": "%ProjectVersion%",
+  "Version": "0.1.0",
   "Description": "Adds touch-friendly previous/next chest and category buttons to Chests Anywhere on mobile.",
   "UniqueID": "OpenAI.ChestsAnywhereMobileNav",
   "EntryDll": "ChestsAnywhereMobileNav.dll",
