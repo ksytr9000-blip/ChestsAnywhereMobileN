@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Reflection;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
@@ -8,11 +9,16 @@ using StardewValley;
 
 namespace ChestsAnywhereMobileNav;
 
+public interface IChestsAnywhereApi
+{
+    bool IsOverlayActive();
+    bool IsOverlayModal();
+}
+
 public sealed class ModEntry : Mod
 {
-    private object? chestsApi;
-    private Delegate? getOverlay;
-    private MethodInfo? isOverlayModalMethod;
+    private IChestsAnywhereApi? api;
+    private object? rawApi;
 
     private Rectangle prevChest;
     private Rectangle nextChest;
@@ -28,58 +34,37 @@ public sealed class ModEntry : Mod
 
     private void OnGameLaunched(object? sender, GameLaunchedEventArgs e)
     {
-        this.chestsApi = this.Helper.ModRegistry.GetApi<object>("Pathoschild.ChestsAnywhere");
-        if (this.chestsApi is null)
+        this.api = this.Helper.ModRegistry.GetApi<IChestsAnywhereApi>("Pathoschild.ChestsAnywhere");
+        this.rawApi = this.Helper.ModRegistry.GetApi<object>("Pathoschild.ChestsAnywhere");
+
+        if (this.api is null)
         {
-            this.Monitor.Log("Chests Anywhere API wasn't found.", LogLevel.Error);
+            this.Monitor.Log("Couldn't get Chests Anywhere API.", LogLevel.Error);
             return;
         }
 
-        Type apiType = this.chestsApi.GetType();
-        FieldInfo? getterField = apiType.GetField("GetOverlay", BindingFlags.Instance | BindingFlags.NonPublic);
-        this.getOverlay = getterField?.GetValue(this.chestsApi) as Delegate;
-        this.isOverlayModalMethod = apiType.GetMethod("IsOverlayModal", BindingFlags.Instance | BindingFlags.Public);
-
-        if (this.getOverlay is null)
-            this.Monitor.Log("Couldn't access Chests Anywhere's overlay getter. The installed Chests Anywhere version may have changed internally.", LogLevel.Error);
-        else
-            this.Monitor.Log("Mobile chest navigation ready.", LogLevel.Info);
+        this.Monitor.Log($"Mobile chest navigation loaded. API type: {this.rawApi?.GetType().FullName ?? "unknown"}", LogLevel.Info);
     }
 
-    private object? GetOverlay()
+    private bool IsOverlayActive()
     {
-        if (this.getOverlay is null)
-            return null;
-
-        try
-        {
-            return this.getOverlay.DynamicInvoke();
-        }
+        try { return this.api?.IsOverlayActive() == true; }
         catch (Exception ex)
         {
-            this.Monitor.LogOnce($"Couldn't read the Chests Anywhere overlay: {ex}", LogLevel.Error);
-            return null;
+            this.Monitor.LogOnce($"Couldn't read Chests Anywhere overlay state: {ex}", LogLevel.Error);
+            return false;
         }
     }
 
     private bool IsOverlayModal()
     {
-        if (this.chestsApi is null || this.isOverlayModalMethod is null)
-            return false;
-
-        try
-        {
-            return (bool)(this.isOverlayModalMethod.Invoke(this.chestsApi, null) ?? false);
-        }
-        catch
-        {
-            return false;
-        }
+        try { return this.api?.IsOverlayModal() == true; }
+        catch { return false; }
     }
 
     private void OnRenderedActiveMenu(object? sender, RenderedActiveMenuEventArgs e)
     {
-        if (!Context.IsWorldReady || this.GetOverlay() is null || this.IsOverlayModal())
+        if (!Context.IsWorldReady || !this.IsOverlayActive() || this.IsOverlayModal())
             return;
 
         this.UpdateButtonBounds();
@@ -92,10 +77,9 @@ public sealed class ModEntry : Mod
 
     private void OnButtonPressed(object? sender, ButtonPressedEventArgs e)
     {
-        if (!Context.IsWorldReady || this.GetOverlay() is null || this.IsOverlayModal())
+        if (!Context.IsWorldReady || !this.IsOverlayActive() || this.IsOverlayModal())
             return;
 
-        // Android taps are normally exposed as MouseLeft. ControllerA is included as a harmless fallback.
         if (e.Button != SButton.MouseLeft && e.Button != SButton.ControllerA)
             return;
 
@@ -115,29 +99,26 @@ public sealed class ModEntry : Mod
         if (method is null)
             return;
 
-        // Don't let the same tap activate an inventory slot underneath our button.
         this.Helper.Input.Suppress(e.Button);
-        this.InvokeOverlayMethod(method);
+        this.InvokeNavigation(method);
     }
 
-    private void InvokeOverlayMethod(string methodName)
+    private void InvokeNavigation(string methodName)
     {
-        object? overlay = this.GetOverlay();
+        object? overlay = this.ResolveOverlay();
         if (overlay is null)
+        {
+            this.Monitor.LogOnce("Chests Anywhere overlay is active, but I couldn't locate its internal overlay object.", LogLevel.Error);
+            Game1.playSound("cancel");
             return;
+        }
 
         try
         {
-            if (!this.CanNavigate(overlay))
-            {
-                Game1.playSound("cancel");
-                return;
-            }
-
             MethodInfo? method = FindMethod(overlay.GetType(), methodName);
             if (method is null)
             {
-                this.Monitor.LogOnce($"Couldn't find Chests Anywhere method '{methodName}'.", LogLevel.Error);
+                this.Monitor.LogOnce($"Couldn't find Chests Anywhere method '{methodName}' on {overlay.GetType().FullName}.", LogLevel.Error);
                 Game1.playSound("cancel");
                 return;
             }
@@ -157,14 +138,68 @@ public sealed class ModEntry : Mod
         }
     }
 
-    private bool CanNavigate(object overlay)
+    private object? ResolveOverlay()
     {
-        PropertyInfo? property = FindProperty(overlay.GetType(), "CanCloseChest");
-        if (property is null)
-            return true;
+        if (this.rawApi is null)
+            return null;
 
-        return property.GetValue(overlay) is not bool canClose || canClose;
+        HashSet<object> visited = new(ReferenceEqualityComparer.Instance);
+        return this.ScanObject(this.rawApi, 0, visited);
     }
+
+    private object? ScanObject(object obj, int depth, HashSet<object> visited)
+    {
+        if (depth > 3 || !visited.Add(obj))
+            return null;
+
+        Type type = obj.GetType();
+        if (HasNavigationMethods(type))
+            return obj;
+
+        for (Type? t = type; t is not null; t = t.BaseType)
+        {
+            foreach (FieldInfo field in t.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+            {
+                object? value;
+                try { value = field.GetValue(obj); }
+                catch { continue; }
+
+                if (value is null || value is string || value.GetType().IsPrimitive)
+                    continue;
+
+                if (value is Delegate del)
+                {
+                    try
+                    {
+                        if (del.Method.GetParameters().Length == 0)
+                        {
+                            object? result = del.DynamicInvoke();
+                            if (result is not null)
+                            {
+                                if (HasNavigationMethods(result.GetType()))
+                                    return result;
+
+                                object? nestedResult = this.ScanObject(result, depth + 1, visited);
+                                if (nestedResult is not null)
+                                    return nestedResult;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                object? nested = this.ScanObject(value, depth + 1, visited);
+                if (nested is not null)
+                    return nested;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool HasNavigationMethods(Type type)
+        => FindMethod(type, "SelectNextChest") is not null
+        && FindMethod(type, "SelectPreviousChest") is not null;
 
     private static MethodInfo? FindMethod(Type? type, string name)
     {
@@ -173,18 +208,6 @@ public sealed class ModEntry : Mod
             MethodInfo? method = type.GetMethod(name, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.DeclaredOnly);
             if (method is not null)
                 return method;
-            type = type.BaseType;
-        }
-        return null;
-    }
-
-    private static PropertyInfo? FindProperty(Type? type, string name)
-    {
-        while (type is not null)
-        {
-            PropertyInfo? property = type.GetProperty(name, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.DeclaredOnly);
-            if (property is not null)
-                return property;
             type = type.BaseType;
         }
         return null;
@@ -200,7 +223,6 @@ public sealed class ModEntry : Mod
         int buttonW = Math.Clamp(screenW / 7, 105, 180);
         int buttonH = Math.Clamp(screenH / 14, 52, 82);
 
-        // Keep the buttons near the screen edges so they cover as few inventory slots as possible.
         int chestY = Math.Clamp(screenH / 2 - buttonH - gap / 2, margin, screenH - (buttonH * 2 + gap + margin));
         int categoryY = chestY + buttonH + gap;
 
@@ -212,7 +234,6 @@ public sealed class ModEntry : Mod
 
     private void DrawButton(SpriteBatch batch, Rectangle bounds, string text)
     {
-        // Simple texture-free UI so this doesn't depend on any asset paths or other UI mods.
         Color fill = Color.Black * 0.72f;
         Color border = Color.White * 0.85f;
         batch.Draw(Game1.staminaRect, bounds, fill);
@@ -222,10 +243,7 @@ public sealed class ModEntry : Mod
         batch.Draw(Game1.staminaRect, new Rectangle(bounds.Right - 2, bounds.Y, 2, bounds.Height), border);
 
         Vector2 size = Game1.smallFont.MeasureString(text);
-        Vector2 pos = new(
-            bounds.X + (bounds.Width - size.X) / 2f,
-            bounds.Y + (bounds.Height - size.Y) / 2f
-        );
+        Vector2 pos = new(bounds.X + (bounds.Width - size.X) / 2f, bounds.Y + (bounds.Height - size.Y) / 2f);
         batch.DrawString(Game1.smallFont, text, pos, Color.White);
     }
 }
