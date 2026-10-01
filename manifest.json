@@ -1,15 +1,9 @@
 {
   "Name": "Chests Anywhere Mobile Nav",
-  "Author": "OpenAI + user",
-  "Version": "0.3.0",
-  "Description": "Android touch navigation buttons for Chests Anywhere.",
+  "Author": "OpenAI + user test build",
+  "Version": "0.4.0",
+  "Description": "Adds touch navigation buttons for Chests Anywhere on Android and captures the real overlay instance for navigation.",
   "UniqueID": "OpenAI.ChestsAnywhereMobileNav",
   "EntryDll": "ChestsAnywhereMobileNav.dll",
-  "MinimumApiVersion": "4.0.0",
-  "Dependencies": [
-    {
-      "UniqueID": "Pathoschild.ChestsAnywhere",
-      "IsRequired": true
-    }
-  ]
+  "MinimumApiVersion": "4.0.0"
 }
