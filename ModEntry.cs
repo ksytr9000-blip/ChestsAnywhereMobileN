@@ -6,6 +6,7 @@ using Microsoft.Xna.Framework.Graphics;
 using StardewModdingAPI;
 using StardewModdingAPI.Events;
 using StardewValley;
+using StardewValley.Menus;
 
 namespace ChestsAnywhereMobileNav;
 
@@ -18,7 +19,7 @@ public interface IChestsAnywhereApi
 public sealed class ModEntry : Mod
 {
     private IChestsAnywhereApi? api;
-    private object? rawApi;
+    private string? lastMenuType;
 
     private Rectangle prevChest;
     private Rectangle nextChest;
@@ -27,57 +28,66 @@ public sealed class ModEntry : Mod
 
     public override void Entry(IModHelper helper)
     {
+        this.Monitor.Log("CAMN v0.3.0 ENTRY OK", LogLevel.Info);
+
         helper.Events.GameLoop.GameLaunched += this.OnGameLaunched;
-        helper.Events.Display.RenderedActiveMenu += this.OnRenderedActiveMenu;
+        helper.Events.Display.Rendered += this.OnRendered;
         helper.Events.Input.ButtonPressed += this.OnButtonPressed;
+        helper.Events.GameLoop.UpdateTicked += this.OnUpdateTicked;
     }
 
     private void OnGameLaunched(object? sender, GameLaunchedEventArgs e)
     {
         this.api = this.Helper.ModRegistry.GetApi<IChestsAnywhereApi>("Pathoschild.ChestsAnywhere");
-        this.rawApi = this.Helper.ModRegistry.GetApi<object>("Pathoschild.ChestsAnywhere");
-
-        if (this.api is null)
-        {
-            this.Monitor.Log("Couldn't get Chests Anywhere API.", LogLevel.Error);
-            return;
-        }
-
-        this.Monitor.Log($"Mobile chest navigation loaded. API type: {this.rawApi?.GetType().FullName ?? "unknown"}", LogLevel.Info);
+        this.Monitor.Log(this.api is null
+            ? "CAMN v0.3.0: Chests Anywhere API not found; ItemGrabMenu fallback enabled."
+            : "CAMN v0.3.0: Chests Anywhere API acquired.", LogLevel.Info);
     }
 
-    private bool IsOverlayActive()
+    private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
+    {
+        string type = Game1.activeClickableMenu?.GetType().FullName ?? "<none>";
+        if (type == this.lastMenuType)
+            return;
+
+        this.lastMenuType = type;
+        bool active = this.SafeOverlayActive();
+        this.Monitor.Log($"CAMN MENU: {type}; overlay={active}", LogLevel.Info);
+    }
+
+    private bool SafeOverlayActive()
     {
         try { return this.api?.IsOverlayActive() == true; }
-        catch (Exception ex)
-        {
-            this.Monitor.LogOnce($"Couldn't read Chests Anywhere overlay state: {ex}", LogLevel.Error);
-            return false;
-        }
-    }
-
-    private bool IsOverlayModal()
-    {
-        try { return this.api?.IsOverlayModal() == true; }
         catch { return false; }
     }
 
-    private void OnRenderedActiveMenu(object? sender, RenderedActiveMenuEventArgs e)
+    private bool ShouldShowButtons()
     {
-        if (!Context.IsWorldReady || !this.IsOverlayActive() || this.IsOverlayModal())
+        if (!Context.IsWorldReady)
+            return false;
+
+        if (this.SafeOverlayActive())
+            return true;
+
+        return Game1.activeClickableMenu is ItemGrabMenu;
+    }
+
+    private void OnRendered(object? sender, RenderedEventArgs e)
+    {
+        if (!this.ShouldShowButtons())
             return;
 
         this.UpdateButtonBounds();
 
-        this.DrawButton(e.SpriteBatch, this.prevChest, "< 상자");
-        this.DrawButton(e.SpriteBatch, this.nextChest, "상자 >");
-        this.DrawButton(e.SpriteBatch, this.prevCategory, "< 분류");
-        this.DrawButton(e.SpriteBatch, this.nextCategory, "분류 >");
+        this.DrawButton(e.SpriteBatch, this.prevChest, "< CHEST");
+        this.DrawButton(e.SpriteBatch, this.nextChest, "CHEST >");
+        this.DrawButton(e.SpriteBatch, this.prevCategory, "< GROUP");
+        this.DrawButton(e.SpriteBatch, this.nextCategory, "GROUP >");
     }
 
     private void OnButtonPressed(object? sender, ButtonPressedEventArgs e)
     {
-        if (!Context.IsWorldReady || !this.IsOverlayActive() || this.IsOverlayModal())
+        if (!this.ShouldShowButtons())
             return;
 
         if (e.Button != SButton.MouseLeft && e.Button != SButton.ControllerA)
@@ -100,56 +110,81 @@ public sealed class ModEntry : Mod
             return;
 
         this.Helper.Input.Suppress(e.Button);
+        this.Monitor.Log($"CAMN TOUCH: {method}", LogLevel.Info);
         this.InvokeNavigation(method);
     }
 
     private void InvokeNavigation(string methodName)
     {
-        object? overlay = this.ResolveOverlay();
+        object? overlay = this.ResolveNavigationObject();
         if (overlay is null)
         {
-            this.Monitor.LogOnce("Chests Anywhere overlay is active, but I couldn't locate its internal overlay object.", LogLevel.Error);
+            this.Monitor.LogOnce("CAMN: buttons work, but Chests Anywhere navigation object wasn't found.", LogLevel.Error);
+            Game1.playSound("cancel");
+            return;
+        }
+
+        MethodInfo? method = FindMethod(overlay.GetType(), methodName);
+        if (method is null)
+        {
+            this.Monitor.LogOnce($"CAMN: method {methodName} not found on {overlay.GetType().FullName}.", LogLevel.Error);
             Game1.playSound("cancel");
             return;
         }
 
         try
         {
-            MethodInfo? method = FindMethod(overlay.GetType(), methodName);
-            if (method is null)
-            {
-                this.Monitor.LogOnce($"Couldn't find Chests Anywhere method '{methodName}' on {overlay.GetType().FullName}.", LogLevel.Error);
-                Game1.playSound("cancel");
-                return;
-            }
-
+            this.Monitor.Log($"CAMN INVOKE: {overlay.GetType().FullName}.{methodName}()", LogLevel.Info);
             method.Invoke(overlay, null);
             Game1.playSound("shwip");
         }
         catch (TargetInvocationException ex)
         {
-            this.Monitor.Log($"Chests Anywhere navigation failed ({methodName}): {ex.InnerException ?? ex}", LogLevel.Error);
+            this.Monitor.Log($"CAMN invoke failed: {ex.InnerException ?? ex}", LogLevel.Error);
             Game1.playSound("cancel");
         }
         catch (Exception ex)
         {
-            this.Monitor.Log($"Chests Anywhere navigation failed ({methodName}): {ex}", LogLevel.Error);
+            this.Monitor.Log($"CAMN invoke failed: {ex}", LogLevel.Error);
             Game1.playSound("cancel");
         }
     }
 
-    private object? ResolveOverlay()
+    private object? ResolveNavigationObject()
     {
-        if (this.rawApi is null)
-            return null;
-
         HashSet<object> visited = new(ReferenceEqualityComparer.Instance);
-        return this.ScanObject(this.rawApi, 0, visited);
+
+        if (Game1.activeClickableMenu is not null)
+        {
+            object? found = this.ScanObject(Game1.activeClickableMenu, 0, visited);
+            if (found is not null)
+                return found;
+        }
+
+        if (this.api is not null)
+        {
+            object? found = this.ScanObject(this.api, 0, visited);
+            if (found is not null)
+                return found;
+        }
+
+        foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            string name = assembly.GetName().Name ?? "";
+            if (!name.Contains("ChestsAnywhere", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            object? found = this.ScanStaticMembers(assembly, visited);
+            if (found is not null)
+                return found;
+        }
+
+        return null;
     }
 
     private object? ScanObject(object obj, int depth, HashSet<object> visited)
     {
-        if (depth > 3 || !visited.Add(obj))
+        if (depth > 6 || !visited.Add(obj))
             return null;
 
         Type type = obj.GetType();
@@ -158,39 +193,92 @@ public sealed class ModEntry : Mod
 
         for (Type? t = type; t is not null; t = t.BaseType)
         {
-            foreach (FieldInfo field in t.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
+
+            foreach (FieldInfo field in t.GetFields(flags))
             {
                 object? value;
                 try { value = field.GetValue(obj); }
                 catch { continue; }
 
-                if (value is null || value is string || value.GetType().IsPrimitive)
+                object? found = this.InspectValue(value, depth, visited);
+                if (found is not null)
+                    return found;
+            }
+
+            foreach (PropertyInfo property in t.GetProperties(flags))
+            {
+                if (property.GetIndexParameters().Length != 0 || property.GetMethod is null)
                     continue;
 
-                if (value is Delegate del)
-                {
-                    try
-                    {
-                        if (del.Method.GetParameters().Length == 0)
-                        {
-                            object? result = del.DynamicInvoke();
-                            if (result is not null)
-                            {
-                                if (HasNavigationMethods(result.GetType()))
-                                    return result;
+                object? value;
+                try { value = property.GetValue(obj); }
+                catch { continue; }
 
-                                object? nestedResult = this.ScanObject(result, depth + 1, visited);
-                                if (nestedResult is not null)
-                                    return nestedResult;
-                            }
-                        }
-                    }
-                    catch { }
-                }
+                object? found = this.InspectValue(value, depth, visited);
+                if (found is not null)
+                    return found;
+            }
+        }
 
-                object? nested = this.ScanObject(value, depth + 1, visited);
-                if (nested is not null)
-                    return nested;
+        return null;
+    }
+
+    private object? InspectValue(object? value, int depth, HashSet<object> visited)
+    {
+        if (value is null || value is string)
+            return null;
+
+        Type type = value.GetType();
+        if (type.IsPrimitive || type.IsEnum || value is decimal)
+            return null;
+
+        if (HasNavigationMethods(type))
+            return value;
+
+        return this.ScanObject(value, depth + 1, visited);
+    }
+
+    private object? ScanStaticMembers(Assembly assembly, HashSet<object> visited)
+    {
+        Type[] types;
+        try { types = assembly.GetTypes(); }
+        catch (ReflectionTypeLoadException ex)
+        {
+            List<Type> safe = new();
+            foreach (Type? type in ex.Types)
+                if (type is not null)
+                    safe.Add(type);
+            types = safe.ToArray();
+        }
+
+        foreach (Type type in types)
+        {
+            const BindingFlags flags = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+
+            foreach (FieldInfo field in type.GetFields(flags))
+            {
+                object? value;
+                try { value = field.GetValue(null); }
+                catch { continue; }
+
+                object? found = this.InspectValue(value, 0, visited);
+                if (found is not null)
+                    return found;
+            }
+
+            foreach (PropertyInfo property in type.GetProperties(flags))
+            {
+                if (property.GetIndexParameters().Length != 0 || property.GetMethod is null)
+                    continue;
+
+                object? value;
+                try { value = property.GetValue(null); }
+                catch { continue; }
+
+                object? found = this.InspectValue(value, 0, visited);
+                if (found is not null)
+                    return found;
             }
         }
 
@@ -205,7 +293,13 @@ public sealed class ModEntry : Mod
     {
         while (type is not null)
         {
-            MethodInfo? method = type.GetMethod(name, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.DeclaredOnly);
+            MethodInfo? method = type.GetMethod(
+                name,
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly,
+                binder: null,
+                types: Type.EmptyTypes,
+                modifiers: null
+            );
             if (method is not null)
                 return method;
             type = type.BaseType;
@@ -217,13 +311,11 @@ public sealed class ModEntry : Mod
     {
         int screenW = Game1.uiViewport.Width;
         int screenH = Game1.uiViewport.Height;
-
-        int margin = 12;
-        int gap = 10;
-        int buttonW = Math.Clamp(screenW / 7, 105, 180);
-        int buttonH = Math.Clamp(screenH / 14, 52, 82);
-
-        int chestY = Math.Clamp(screenH / 2 - buttonH - gap / 2, margin, screenH - (buttonH * 2 + gap + margin));
+        int margin = 24;
+        int gap = 16;
+        int buttonW = Math.Clamp(screenW / 5, 160, 280);
+        int buttonH = Math.Clamp(screenH / 11, 72, 110);
+        int chestY = Math.Max(margin, screenH / 2 - buttonH - gap / 2);
         int categoryY = chestY + buttonH + gap;
 
         this.prevChest = new Rectangle(margin, chestY, buttonW, buttonH);
@@ -234,13 +326,14 @@ public sealed class ModEntry : Mod
 
     private void DrawButton(SpriteBatch batch, Rectangle bounds, string text)
     {
-        Color fill = Color.Black * 0.72f;
-        Color border = Color.White * 0.85f;
+        Color fill = new(0, 0, 0, 220);
+        Color border = Color.Yellow;
+
         batch.Draw(Game1.staminaRect, bounds, fill);
-        batch.Draw(Game1.staminaRect, new Rectangle(bounds.X, bounds.Y, bounds.Width, 2), border);
-        batch.Draw(Game1.staminaRect, new Rectangle(bounds.X, bounds.Bottom - 2, bounds.Width, 2), border);
-        batch.Draw(Game1.staminaRect, new Rectangle(bounds.X, bounds.Y, 2, bounds.Height), border);
-        batch.Draw(Game1.staminaRect, new Rectangle(bounds.Right - 2, bounds.Y, 2, bounds.Height), border);
+        batch.Draw(Game1.staminaRect, new Rectangle(bounds.X, bounds.Y, bounds.Width, 5), border);
+        batch.Draw(Game1.staminaRect, new Rectangle(bounds.X, bounds.Bottom - 5, bounds.Width, 5), border);
+        batch.Draw(Game1.staminaRect, new Rectangle(bounds.X, bounds.Y, 5, bounds.Height), border);
+        batch.Draw(Game1.staminaRect, new Rectangle(bounds.Right - 5, bounds.Y, 5, bounds.Height), border);
 
         Vector2 size = Game1.smallFont.MeasureString(text);
         Vector2 pos = new(bounds.X + (bounds.Width - size.X) / 2f, bounds.Y + (bounds.Height - size.Y) / 2f);
