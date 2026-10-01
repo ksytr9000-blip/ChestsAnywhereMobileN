@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
+using HarmonyLib;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using StardewModdingAPI;
@@ -18,7 +20,11 @@ public interface IChestsAnywhereApi
 
 public sealed class ModEntry : Mod
 {
+    private static ModEntry? Instance;
+    private static WeakReference<object>? CapturedNavigationObject;
+
     private IChestsAnywhereApi? api;
+    private Harmony? harmony;
     private string? lastMenuType;
 
     private Rectangle prevChest;
@@ -28,7 +34,8 @@ public sealed class ModEntry : Mod
 
     public override void Entry(IModHelper helper)
     {
-        this.Monitor.Log("CAMN v0.3.0 ENTRY OK", LogLevel.Info);
+        Instance = this;
+        this.Monitor.Log("CAMN v0.4.0 ENTRY OK", LogLevel.Info);
 
         helper.Events.GameLoop.GameLaunched += this.OnGameLaunched;
         helper.Events.Display.Rendered += this.OnRendered;
@@ -40,8 +47,84 @@ public sealed class ModEntry : Mod
     {
         this.api = this.Helper.ModRegistry.GetApi<IChestsAnywhereApi>("Pathoschild.ChestsAnywhere");
         this.Monitor.Log(this.api is null
-            ? "CAMN v0.3.0: Chests Anywhere API not found; ItemGrabMenu fallback enabled."
-            : "CAMN v0.3.0: Chests Anywhere API acquired.", LogLevel.Info);
+            ? "CAMN: Chests Anywhere API not found; menu fallback enabled."
+            : "CAMN: Chests Anywhere API acquired.", LogLevel.Info);
+
+        this.TryPatchNavigationOverlayConstructors();
+    }
+
+    private void TryPatchNavigationOverlayConstructors()
+    {
+        try
+        {
+            this.harmony = new Harmony(this.ModManifest.UniqueID);
+            MethodInfo postfix = AccessTools.Method(typeof(ModEntry), nameof(CaptureNavigationObject));
+
+            int candidateTypes = 0;
+            int patchedConstructors = 0;
+
+            foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type[] types = SafeGetTypes(assembly);
+                foreach (Type type in types)
+                {
+                    if (type == typeof(ModEntry))
+                        continue;
+
+                    string fullName = type.FullName ?? "";
+                    if (!fullName.Contains("ChestsAnywhere", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    if (!HasNavigationMethods(type))
+                        continue;
+
+                    candidateTypes++;
+                    this.Monitor.Log($"CAMN NAV TYPE: {fullName}; abstract={type.IsAbstract}", LogLevel.Info);
+
+                    if (type.IsAbstract)
+                        continue;
+
+                    ConstructorInfo[] ctors = type.GetConstructors(
+                        BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic
+                    );
+
+                    foreach (ConstructorInfo ctor in ctors)
+                    {
+                        try
+                        {
+                            this.harmony.Patch(ctor, postfix: new HarmonyMethod(postfix));
+                            patchedConstructors++;
+                        }
+                        catch (Exception ex)
+                        {
+                            this.Monitor.Log($"CAMN: couldn't patch ctor {fullName}: {ex.Message}", LogLevel.Warn);
+                        }
+                    }
+                }
+            }
+
+            this.Monitor.Log($"CAMN PATCH SUMMARY: navigationTypes={candidateTypes}, constructors={patchedConstructors}", LogLevel.Info);
+        }
+        catch (Exception ex)
+        {
+            this.Monitor.Log($"CAMN Harmony setup failed: {ex}", LogLevel.Error);
+        }
+    }
+
+    private static void CaptureNavigationObject(object __instance)
+    {
+        try
+        {
+            if (__instance is null || !HasNavigationMethods(__instance.GetType()))
+                return;
+
+            CapturedNavigationObject = new WeakReference<object>(__instance);
+            Instance?.Monitor.Log($"CAMN CAPTURED: {__instance.GetType().FullName}", LogLevel.Info);
+        }
+        catch (Exception ex)
+        {
+            Instance?.Monitor.Log($"CAMN capture failed: {ex.Message}", LogLevel.Warn);
+        }
     }
 
     private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
@@ -52,7 +135,8 @@ public sealed class ModEntry : Mod
 
         this.lastMenuType = type;
         bool active = this.SafeOverlayActive();
-        this.Monitor.Log($"CAMN MENU: {type}; overlay={active}", LogLevel.Info);
+        bool captured = TryGetCapturedNavigationObject(out object? nav);
+        this.Monitor.Log($"CAMN MENU: {type}; overlay={active}; captured={captured}{(nav is null ? "" : $"; nav={nav.GetType().FullName}")}", LogLevel.Info);
     }
 
     private bool SafeOverlayActive()
@@ -69,7 +153,14 @@ public sealed class ModEntry : Mod
         if (this.SafeOverlayActive())
             return true;
 
-        return Game1.activeClickableMenu is ItemGrabMenu;
+        // Android SMAPI wraps the real chest menu in ItemGrabMenuFacade,
+        // which derives from / behaves like ItemGrabMenu depending on build.
+        object? menu = Game1.activeClickableMenu;
+        if (menu is ItemGrabMenu)
+            return true;
+
+        string name = menu?.GetType().FullName ?? "";
+        return name.Contains("ItemGrabMenuFacade", StringComparison.Ordinal);
     }
 
     private void OnRendered(object? sender, RenderedEventArgs e)
@@ -116,26 +207,37 @@ public sealed class ModEntry : Mod
 
     private void InvokeNavigation(string methodName)
     {
-        object? overlay = this.ResolveNavigationObject();
-        if (overlay is null)
+        object? nav = null;
+
+        // Preferred path: capture the real Chests Anywhere overlay instance
+        // at construction time, before Android hides it behind a facade.
+        if (!TryGetCapturedNavigationObject(out nav))
         {
-            this.Monitor.LogOnce("CAMN: buttons work, but Chests Anywhere navigation object wasn't found.", LogLevel.Error);
+            // Fallback: scan the active menu tree in case a future build exposes it.
+            HashSet<object> visited = new(ReferenceEqualityComparer.Instance);
+            if (Game1.activeClickableMenu is not null)
+                nav = this.ScanObject(Game1.activeClickableMenu, 0, visited);
+        }
+
+        if (nav is null)
+        {
+            this.Monitor.Log("CAMN: no captured Chests Anywhere navigation object yet.", LogLevel.Error);
             Game1.playSound("cancel");
             return;
         }
 
-        MethodInfo? method = FindMethod(overlay.GetType(), methodName);
+        MethodInfo? method = FindMethod(nav.GetType(), methodName);
         if (method is null)
         {
-            this.Monitor.LogOnce($"CAMN: method {methodName} not found on {overlay.GetType().FullName}.", LogLevel.Error);
+            this.Monitor.Log($"CAMN: method {methodName} not found on {nav.GetType().FullName}.", LogLevel.Error);
             Game1.playSound("cancel");
             return;
         }
 
         try
         {
-            this.Monitor.Log($"CAMN INVOKE: {overlay.GetType().FullName}.{methodName}()", LogLevel.Info);
-            method.Invoke(overlay, null);
+            this.Monitor.Log($"CAMN INVOKE: {nav.GetType().FullName}.{methodName}()", LogLevel.Info);
+            method.Invoke(nav, null);
             Game1.playSound("shwip");
         }
         catch (TargetInvocationException ex)
@@ -150,41 +252,25 @@ public sealed class ModEntry : Mod
         }
     }
 
-    private object? ResolveNavigationObject()
+    private static bool TryGetCapturedNavigationObject(out object? nav)
     {
-        HashSet<object> visited = new(ReferenceEqualityComparer.Instance);
+        nav = null;
+        if (CapturedNavigationObject is null)
+            return false;
 
-        if (Game1.activeClickableMenu is not null)
-        {
-            object? found = this.ScanObject(Game1.activeClickableMenu, 0, visited);
-            if (found is not null)
-                return found;
-        }
+        if (!CapturedNavigationObject.TryGetTarget(out object? value) || value is null)
+            return false;
 
-        if (this.api is not null)
-        {
-            object? found = this.ScanObject(this.api, 0, visited);
-            if (found is not null)
-                return found;
-        }
+        if (!HasNavigationMethods(value.GetType()))
+            return false;
 
-        foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
-        {
-            string name = assembly.GetName().Name ?? "";
-            if (!name.Contains("ChestsAnywhere", StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            object? found = this.ScanStaticMembers(assembly, visited);
-            if (found is not null)
-                return found;
-        }
-
-        return null;
+        nav = value;
+        return true;
     }
 
     private object? ScanObject(object obj, int depth, HashSet<object> visited)
     {
-        if (depth > 6 || !visited.Add(obj))
+        if (depth > 8 || !visited.Add(obj))
             return null;
 
         Type type = obj.GetType();
@@ -239,50 +325,20 @@ public sealed class ModEntry : Mod
         return this.ScanObject(value, depth + 1, visited);
     }
 
-    private object? ScanStaticMembers(Assembly assembly, HashSet<object> visited)
+    private static Type[] SafeGetTypes(Assembly assembly)
     {
-        Type[] types;
-        try { types = assembly.GetTypes(); }
+        try
+        {
+            return assembly.GetTypes();
+        }
         catch (ReflectionTypeLoadException ex)
         {
-            List<Type> safe = new();
-            foreach (Type? type in ex.Types)
-                if (type is not null)
-                    safe.Add(type);
-            types = safe.ToArray();
+            return ex.Types.Where(p => p is not null).Cast<Type>().ToArray();
         }
-
-        foreach (Type type in types)
+        catch
         {
-            const BindingFlags flags = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
-
-            foreach (FieldInfo field in type.GetFields(flags))
-            {
-                object? value;
-                try { value = field.GetValue(null); }
-                catch { continue; }
-
-                object? found = this.InspectValue(value, 0, visited);
-                if (found is not null)
-                    return found;
-            }
-
-            foreach (PropertyInfo property in type.GetProperties(flags))
-            {
-                if (property.GetIndexParameters().Length != 0 || property.GetMethod is null)
-                    continue;
-
-                object? value;
-                try { value = property.GetValue(null); }
-                catch { continue; }
-
-                object? found = this.InspectValue(value, 0, visited);
-                if (found is not null)
-                    return found;
-            }
+            return Array.Empty<Type>();
         }
-
-        return null;
     }
 
     private static bool HasNavigationMethods(Type type)
@@ -311,12 +367,14 @@ public sealed class ModEntry : Mod
     {
         int screenW = Game1.uiViewport.Width;
         int screenH = Game1.uiViewport.Height;
-        int margin = 24;
-        int gap = 16;
-        int buttonW = Math.Clamp(screenW / 5, 160, 280);
-        int buttonH = Math.Clamp(screenH / 11, 72, 110);
-        int chestY = Math.Max(margin, screenH / 2 - buttonH - gap / 2);
-        int categoryY = chestY + buttonH + gap;
+        int margin = 18;
+        int gap = 10;
+        int buttonW = Math.Clamp(screenW / 7, 130, 210);
+        int buttonH = Math.Clamp(screenH / 14, 62, 88);
+
+        // Keep the buttons lower and smaller so they obscure less of the chest UI.
+        int categoryY = Math.Max(margin, screenH - margin - buttonH);
+        int chestY = categoryY - gap - buttonH;
 
         this.prevChest = new Rectangle(margin, chestY, buttonW, buttonH);
         this.nextChest = new Rectangle(screenW - margin - buttonW, chestY, buttonW, buttonH);
@@ -326,17 +384,21 @@ public sealed class ModEntry : Mod
 
     private void DrawButton(SpriteBatch batch, Rectangle bounds, string text)
     {
-        Color fill = new(0, 0, 0, 220);
+        Color fill = new(0, 0, 0, 205);
         Color border = Color.Yellow;
 
         batch.Draw(Game1.staminaRect, bounds, fill);
-        batch.Draw(Game1.staminaRect, new Rectangle(bounds.X, bounds.Y, bounds.Width, 5), border);
-        batch.Draw(Game1.staminaRect, new Rectangle(bounds.X, bounds.Bottom - 5, bounds.Width, 5), border);
-        batch.Draw(Game1.staminaRect, new Rectangle(bounds.X, bounds.Y, 5, bounds.Height), border);
-        batch.Draw(Game1.staminaRect, new Rectangle(bounds.Right - 5, bounds.Y, 5, bounds.Height), border);
+        batch.Draw(Game1.staminaRect, new Rectangle(bounds.X, bounds.Y, bounds.Width, 4), border);
+        batch.Draw(Game1.staminaRect, new Rectangle(bounds.X, bounds.Bottom - 4, bounds.Width, 4), border);
+        batch.Draw(Game1.staminaRect, new Rectangle(bounds.X, bounds.Y, 4, bounds.Height), border);
+        batch.Draw(Game1.staminaRect, new Rectangle(bounds.Right - 4, bounds.Y, 4, bounds.Height), border);
 
         Vector2 size = Game1.smallFont.MeasureString(text);
-        Vector2 pos = new(bounds.X + (bounds.Width - size.X) / 2f, bounds.Y + (bounds.Height - size.Y) / 2f);
-        batch.DrawString(Game1.smallFont, text, pos, Color.White);
+        float scale = Math.Min(1f, (bounds.Width - 12f) / Math.Max(1f, size.X));
+        Vector2 pos = new(
+            bounds.X + (bounds.Width - size.X * scale) / 2f,
+            bounds.Y + (bounds.Height - size.Y * scale) / 2f
+        );
+        batch.DrawString(Game1.smallFont, text, pos, Color.White, 0f, Vector2.Zero, scale, SpriteEffects.None, 0f);
     }
 }
