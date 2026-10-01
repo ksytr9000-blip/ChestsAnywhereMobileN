@@ -1,12 +1,11 @@
 {
   "Name": "Chests Anywhere Mobile Nav",
   "Author": "OpenAI + user",
-  "Version": "0.1.0",
-  "Description": "Adds touch-friendly previous/next chest and category buttons to Chests Anywhere on mobile.",
+  "Version": "0.3.0",
+  "Description": "Android touch navigation buttons for Chests Anywhere.",
   "UniqueID": "OpenAI.ChestsAnywhereMobileNav",
   "EntryDll": "ChestsAnywhereMobileNav.dll",
   "MinimumApiVersion": "4.0.0",
-  "UpdateKeys": [],
   "Dependencies": [
     {
       "UniqueID": "Pathoschild.ChestsAnywhere",
